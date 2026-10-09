@@ -1,0 +1,191 @@
+# Deploy the following resources
+# 1.	IAM Role with necessary permissions
+# 2.	IAM Policy to allow required actions
+# 3.	AWS Step Function to orchestrate a workflow
+# 4.	AWS Glue Job to process data
+# 5.	SQS Queue to handle messages
+# 6.	SNS Topic to send notifications
+
+Parameters:
+  ScriptBucketName:
+    Type: String
+    Description: "S3 bucket where Glue scripts and temp files are stored"
+    Default: "dnag-s3-demo-bucket"
+
+Resources:
+  cfnExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: CFN-Glue-Step-SQS-SNS-ExecutionRole
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudformation.amazonaws.com
+            Action: sts:AssumeRole
+
+      Policies:
+        - PolicyName: GlueStepSqsSnsAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # Glue
+              - Effect: Allow
+                Action: glue:*
+                Resource: "*"
+
+              # Step Functions
+              - Effect: Allow
+                Action: states:*
+                Resource: "*"
+
+              # SQS
+              - Effect: Allow
+                Action: sqs:*
+                Resource: "*"
+
+              # SNS
+              - Effect: Allow
+                Action: sns:*
+                Resource: "*"
+
+  # IAM ROLE FOR GLUE JOB
+  cfnGlueJobRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: GlueHelloWorldRole
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: GlueS3Access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: glue:*
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub "arn:aws:s3:::${ScriptBucketName}"
+                  - !Sub "arn:aws:s3:::${ScriptBucketName}/*"
+
+  # GLUE JOB
+  cfnHelloGlueJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: hello-glue-job
+      Role: !GetAtt cfnGlueJobRole.Arn
+      Command:
+        Name: pythonshell
+        ScriptLocation: !Sub "s3://${ScriptBucketName}/hello.py"
+        PythonVersion: "3.9"
+      GlueVersion: "4.0"
+      MaxRetries: 0
+      Timeout: 5
+
+  # SQS QUEUE
+  cfnMessageQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: "message-processing-queue"
+      VisibilityTimeout: 30
+      MessageRetentionPeriod: 86400
+      ReceiveMessageWaitTimeSeconds: 10
+
+  # SNS TOPIC
+  cfnNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: "workflow-notifications"
+
+  # IAM ROLE FOR STEP FUNCTIONS
+  cfnStepFunctionsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: StepFunctionsWorkflowRole
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: StepFunctionsFullAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - glue:StartJobRun
+                  - sqs:SendMessage
+                  - sns:Publish
+                Resource: "*"
+
+  # STEP FUNCTIONS STATE MACHINE
+  cfnWorkflowStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: "GlueSqsSnsWorkflow"
+      RoleArn: !GetAtt cfnStepFunctionsRole.Arn
+      DefinitionString:
+        Fn::Sub: |
+          {
+            "Comment": "Glue → SQS → SNS Workflow",
+            "StartAt": "Start",
+            "States": {
+              "Start": {
+                "Type": "Pass",
+                "Next": "TriggerGlueJob"
+              },
+              "TriggerGlueJob": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::glue:startJobRun",
+                "Parameters": {
+                  "JobName": "hello-glue-job"
+                },
+                "Next": "SendMessageToSQS"
+              },
+              "SendMessageToSQS": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::sqs:sendMessage",
+                "Parameters": {
+                  "QueueUrl": "${cfnMessageQueue}",
+                  "MessageBody": "Glue job completed"
+                },
+                "Next": "SendNotificationSNS"
+              },
+              "SendNotificationSNS": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::sns:publish",
+                "Parameters": {
+                  "TopicArn": "${cfnNotificationTopic}",
+                  "Message": "Workflow completed successfully"
+                },
+                "Next": "Stop"
+              },
+              "Stop": {
+                "Type": "Succeed"
+              }
+            }
+          }
+
+Outputs:
+  GlueJobName:
+    Value: !Ref cfnHelloGlueJob
+  SQSQueueURL:
+    Value: !Ref cfnMessageQueue
+  SNSTopicARN:
+    Value: !Ref cfnNotificationTopic
+  StepFunctionARN:
+    Value: !Ref cfnWorkflowStateMachine
